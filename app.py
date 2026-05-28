@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import datetime
 import urllib.parse
+import time
 
 # ==========================================
 # 1. API 키 설정 및 디코딩
@@ -38,30 +39,32 @@ def kst_now():
     return datetime.datetime.now(KST)
 
 def get_recent_base_datetime():
-    # 기상청 업데이트 지연을 고려해 15분 뺌
-    now = kst_now() - datetime.timedelta(minutes=15)
-    hour = now.hour
-    if hour < 2:
+    # 오늘 점심(12~13시)이 오후·저녁에도 항상 예보에 포함되도록 base_time을 1100 이하로 제한한다.
+    # (1400 이후 발표는 예보가 14시부터 시작해 오늘 점심이 빠져버림)
+    now = kst_now() - datetime.timedelta(minutes=15)  # 기상청 제공 지연 버퍼
+    if now.hour < 2:
+        # 새벽엔 전날 2300 발표 사용 (오늘 0시 이후 예보 포함)
         base_date = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
-        base_time = "2300"
-    else:
-        base_date = now.strftime("%Y%m%d")
-        # 02,05,08,11,14,17,20,23시 발표 중 가장 최근 시각
-        base_hour = (hour + 1) // 3 * 3 - 1
-        base_time = f"{base_hour:02d}00"
-    return base_date, base_time
+        return base_date, "2300"
+    # 02,05,08,11 발표 중 지금까지 나온 가장 최근 시각 (11시 상한 → 오늘 점심 포함)
+    base_date = now.strftime("%Y%m%d")
+    for bt in (11, 8, 5, 2):
+        if now.hour >= bt:
+            return base_date, f"{bt:02d}00"
+    return base_date, "0200"
 
 # ==========================================
-# 3. 데이터 수집 (단기예보 — 오늘~모레까지 안정 제공)
+# 3. 데이터 수집 (단기예보 — 한 번 호출로 오늘~모레 전부 받음)
 # ==========================================
-@st.cache_data(ttl=1800)  # 30분 캐싱
-def fetch_weather(target_date_str, nx, ny, target_hours=("12", "13")):
+# 성공한 결과만 30분 캐싱한다. 실패하면 예외를 던져서 캐시되지 않게 하고
+# (st.cache_data는 예외를 캐시하지 않음), 다음 실행 때 다시 시도하도록 한다.
+@st.cache_data(ttl=1800)
+def fetch_weather(nx, ny):
     base_date, base_time = get_recent_base_datetime()
     url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
-
     params = {
         "serviceKey": DECODED_KEY,
-        "numOfRows": "1000",  # 모레 12~13시까지 잘리지 않게 충분히 받음
+        "numOfRows": "1000",  # 오늘~모레 12~13시까지 잘리지 않게 충분히 받음
         "pageNo": "1",
         "dataType": "JSON",
         "base_date": base_date,
@@ -70,28 +73,43 @@ def fetch_weather(target_date_str, nx, ny, target_hours=("12", "13")):
         "ny": ny,
     }
 
-    TMPs = {h: None for h in target_hours}
-    POPs = {h: None for h in target_hours}
+    last_err = "알 수 없는 오류"
+    for _ in range(3):  # 일시적 실패(네트워크/혼잡)에 대비해 최대 3회 재시도
+        try:
+            res = requests.get(url, params=params, timeout=8)
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                time.sleep(0.6)
+                continue
+            data = res.json()
+            if data["response"]["header"]["resultCode"] != "00":
+                last_err = data["response"]["header"].get("resultMsg", "API 오류")
+                time.sleep(0.6)
+                continue
 
-    try:
-        res = requests.get(url, params=params, timeout=8)
-        data = res.json()
+            items = data["response"]["body"]["items"]["item"]
+            # 날짜별 {"TMP": {시각: 값}, "POP": {시각: 값}} 형태로 정리
+            by_date = {}
+            for item in items:
+                d = item["fcstDate"]
+                cat = item["category"]
+                if cat not in ("TMP", "POP"):
+                    continue
+                by_date.setdefault(d, {"TMP": {}, "POP": {}})
+                by_date[d][cat][item["fcstTime"][:2]] = float(item["fcstValue"])
+            return by_date
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(0.6)
 
-        if data["response"]["header"]["resultCode"] != "00":
-            return TMPs, POPs
+    raise RuntimeError(last_err)
 
-        items = data["response"]["body"]["items"]["item"]
-        for item in items:
-            if item["fcstDate"] == target_date_str:
-                fcst_hour = item["fcstTime"][:2]
-                if fcst_hour in target_hours:
-                    if item["category"] == "TMP":
-                        TMPs[fcst_hour] = float(item["fcstValue"])
-                    elif item["category"] == "POP":
-                        POPs[fcst_hour] = float(item["fcstValue"])
-        return TMPs, POPs
-    except Exception:
-        return TMPs, POPs
+
+def extract_day(by_date, date_str, hours=("12", "13")):
+    day = by_date.get(date_str, {"TMP": {}, "POP": {}})
+    tmp = {h: day["TMP"].get(h) for h in hours}
+    pop = {h: day["POP"].get(h) for h in hours}
+    return tmp, pop
 
 # ==========================================
 # 4. 장소 추천 우선순위 로직 (운동장 > 필로티 > 교실)
@@ -107,17 +125,17 @@ def judge_lunch(tmp_dict, pop_dict):
 
     # 기온이 범위를 벗어나면 교실 (최우선 안전 판단)
     if avg_temp < 12:
-        return "교실", "classroom", f"기온이 **{avg_temp:.1f}°C**로 쌀쌀해서 실내가 안전해요."
+        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 쌀쌀해서 실내가 안전해요."
     if avg_temp > 30:
-        return "교실", "classroom", f"기온이 **{avg_temp:.1f}°C**로 너무 더워서 실내가 안전해요."
+        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 너무 더워서 실내가 안전해요."
 
     # 기온은 적절하지만 비 소식 → 필로티
     max_pop = max(pops)
     if max_pop >= 30:
-        return "필로티", "piloti", f"기온은 좋지만 비 올 확률이 **{max_pop:.0f}%**라 비를 피할 수 있는 곳이 좋아요."
+        return "필로티", "piloti", f"기온은 좋지만 비 올 확률이 {max_pop:.0f}%라 비를 피할 수 있는 곳이 좋아요."
 
     # 기온 적절 + 비 안 옴 → 운동장
-    return "운동장", "playground", f"기온 **{avg_temp:.1f}°C**, 강수확률 **{max_pop:.0f}%**로 야외활동에 딱 좋아요!"
+    return "운동장", "playground", f"기온 {avg_temp:.1f}°C, 강수확률 {max_pop:.0f}%로 야외활동에 딱 좋아요!"
 
 def calc_summary(tmp_dict, pop_dict):
     temps = [v for v in tmp_dict.values() if v is not None]
@@ -170,8 +188,8 @@ def render_box(kind, text):
 
 def render_place(status_code, reason):
     info = PLACE_INFO[status_code]
-    render_box(info["box"], f"## {info['headline']}")
-    st.write(f"**이유:** {reason}")
+    render_box(info["box"], info["headline"])
+    st.caption(f"💬 {reason}")
 
     act_tab, safe_tab = st.tabs(["💡 추천 놀이", "🚨 안전 수칙"])
     with act_tab:
@@ -198,7 +216,7 @@ tab1, tab2 = st.tabs(["📍 지역 선택", "📅 점심시간 장소 추천"])
 with tab1:
     location_name = st.selectbox("경기도 내 지역을 선택하세요", list(LOCATIONS.keys()))
     st.session_state["location_name"] = location_name
-    st.info("지역을 고른 뒤 위의 **'📅 점심시간 장소 추천'** 탭을 눌러 결과를 확인하세요!")
+    st.info("지역을 고른 뒤 위의 '📅 점심시간 장소 추천' 탭을 눌러 결과를 확인하세요!")
 
 # --- 탭 2: 결과 ---
 with tab2:
@@ -209,21 +227,36 @@ with tab2:
 
     st.markdown(f"#### 📍 {location_name} · 점심시간(12~13시) 예보")
 
-    results = []
+    by_date = None
+    fetch_error = None
     with st.spinner(f"기상청에서 {location_name} 예보를 가져오는 중입니다..."):
-        for offset, d in enumerate(day_list):
-            tmp_dict, pop_dict = fetch_weather(d.strftime("%Y%m%d"), nx, ny)
-            temp_avg, pop_max = calc_summary(tmp_dict, pop_dict)
-            place, status_code, reason = judge_lunch(tmp_dict, pop_dict)
-            results.append({
-                "구분": REL_LABEL[offset],
-                "날짜": d.strftime("%m/%d") + f" ({WEEKDAY_KR[d.weekday()]})",
-                "기온(°C)": temp_avg if temp_avg is not None else "-",
-                "강수확률(%)": pop_max if pop_max is not None else "-",
-                "추천 장소": place,
-                "_status_code": status_code,
-                "_reason": reason,
-            })
+        try:
+            by_date = fetch_weather(nx, ny)  # 한 번 호출로 오늘~모레 전부
+        except Exception as e:
+            fetch_error = str(e)
+
+    if fetch_error:
+        st.error("기상청 서버에서 예보를 받지 못했어요. 잠시 후 다시 시도해 주세요.")
+        st.caption(f"(원인: {fetch_error})")
+        if st.button("🔄 다시 시도"):
+            fetch_weather.clear()  # 캐시 비우고 다시 호출
+            st.rerun()
+        st.stop()
+
+    results = []
+    for offset, d in enumerate(day_list):
+        tmp_dict, pop_dict = extract_day(by_date, d.strftime("%Y%m%d"))
+        temp_avg, pop_max = calc_summary(tmp_dict, pop_dict)
+        place, status_code, reason = judge_lunch(tmp_dict, pop_dict)
+        results.append({
+            "구분": REL_LABEL[offset],
+            "날짜": d.strftime("%m/%d") + f" ({WEEKDAY_KR[d.weekday()]})",
+            "기온(°C)": temp_avg if temp_avg is not None else "-",
+            "강수확률(%)": pop_max if pop_max is not None else "-",
+            "추천 장소": place,
+            "_status_code": status_code,
+            "_reason": reason,
+        })
 
     df = pd.DataFrame(results)
     st.dataframe(
