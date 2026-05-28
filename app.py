@@ -147,7 +147,7 @@ with tab1:
     st.session_state["location_name"] = location_name
     st.session_state["week_dates"] = week_dates
 
-# --- 탭 2: 결과 확인 및 오늘 알림 ---
+# --- 탭 2: 결과 확인 및 날짜별 알림 ---
 with tab2:
     if "location_name" in st.session_state and "week_dates" in st.session_state:
         location_name = st.session_state["location_name"]
@@ -155,7 +155,6 @@ with tab2:
         nx, ny = LOCATIONS[location_name]
         
         results = []
-        today_place, today_status_code, today_reason = "", "unknown", ""
         
         with st.spinner(f"기상청에서 {location_name} 예보를 가져오는 중입니다..."):
             for d in week_dates:
@@ -165,42 +164,56 @@ with tab2:
                 temp_avg, pop_max = calc_lunch_summary(tmp_dict, pop_dict)
                 place, status_code, reason_str = judge_lunch(tmp_dict, pop_dict)
                 
-                # 오늘 데이터 저장
-                if d == datetime.date.today():
-                    today_place, today_status_code, today_reason = place, status_code, reason_str
-                    
+                # 내부 로직 처리를 위해 status_code, reason_str 별도 저장
                 results.append({
                     "날짜": d.strftime("%Y-%m-%d"),
                     "요일": "월화수목금"[d.weekday()],
                     "기온(°C)": temp_avg if temp_avg is not None else "-",
                     "강수확률(%)": pop_max if pop_max is not None else "-",
                     "추천 장소": place,
-                    "판정 이유": reason_str
+                    "판정 이유": reason_str,
+                    "_status_code": status_code, # UI 표에는 보이지 않게 숨김 처리용
+                    "_reason": reason_str
                 })
                     
-        # 주간 예보 표 렌더링
+        # 주간 예보 표 렌더링 (숨김 컬럼 제외)
         df = pd.DataFrame(results)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        display_df = df.drop(columns=["_status_code", "_reason"])
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
             
         st.markdown("---")
         
         # ==========================================
-        # ★ 하단 알림 및 추천활동/안전수칙 UI ★
+        # ★ 하단 알림 및 추천활동/안전수칙 UI (날짜 선택형) ★
         # ==========================================
-        st.subheader("📢 오늘 점심시간 활동 안내")
+        date_options = [r["날짜"] for r in results]
         
-        if today_status_code == "unknown":
-            st.info("오늘 점심 예보 정보를 불러올 수 없거나, 주말/과거 날짜입니다.")
+        # 날짜를 클릭(선택)할 수 있는 라디오 버튼 (가로 정렬로 버튼처럼 보이게 구성)
+        selected_date = st.radio(
+            "👇 점심시간 활동 안내를 확인할 날짜를 누르세요:", 
+            date_options, 
+            horizontal=True
+        )
+        
+        # 선택된 날짜의 데이터 추출
+        selected_data = next(r for r in results if r["날짜"] == selected_date)
+        sel_status_code = selected_data["_status_code"]
+        sel_reason = selected_data["_reason"]
+        sel_weekday = selected_data["요일"]
+
+        st.subheader(f"📢 {selected_date}({sel_weekday}) 점심시간 활동 안내")
+        
+        if sel_status_code == "unknown":
+            st.info("아직 날씨예보가 발표되지 않았어요. (기상청 단기예보는 최대 3일까지만 제공됩니다)")
             
-        elif today_status_code == "playground":
-            st.success("## 🏃 야외활동 최고! 오늘은 [ 운동장 ] 으로 나가요!")
-            st.write(f"**이유:** {today_reason}")
+        elif sel_status_code == "playground":
+            st.success(f"## 🏃 야외활동 최고! {sel_weekday}요일엔 [ 운동장 ] 으로 나가요!")
+            st.write(f"**이유:** {sel_reason}")
             
             act_tab, safe_tab = st.tabs(["💡 추천 놀이", "🚨 안전 수칙"])
             with act_tab:
                 st.write("버튼을 누르면 놀이 방법을 볼 수 있어요!")
                 c1, c2, c3 = st.columns(3)
-                # st.popover를 사용하여 버튼 클릭 시 팝업창처럼 설명 띄우기 (요구사항 #6)
                 with c1: 
                     with st.popover("⚽ 축구 / 발야구", use_container_width=True):
                         st.markdown("**축구 / 발야구 놀이방법**\n\n- 공을 발로 차서 상대편 골대에 넣거나 베이스를 돌아서 점수를 내는 활동입니다. \n- 팀을 나누어 협동심을 기를 수 있어요!")
@@ -214,9 +227,9 @@ with tab2:
             with safe_tab:
                 st.info("✔ 햇빛이 뜨거울 땐 모자를 쓰고 물을 자주 마셔요!\n\n✔ 기온이 12도 정도로 약간 서늘할 수 있으니 겉옷을 꼭 챙겨 입어요.\n\n✔ 놀이기구에서 친구를 밀거나 당기지 않도록 주의해요!")
             
-        elif today_status_code == "piloti":
-            st.warning("## ☂ 비 소식이 있어요. 오늘은 [ 필로티 ] 에서 놀아요!")
-            st.write(f"**이유:** {today_reason}")
+        elif sel_status_code == "piloti":
+            st.warning(f"## ☂ 비 소식이 있어요. {sel_weekday}요일엔 [ 필로티 ] 에서 놀아요!")
+            st.write(f"**이유:** {sel_reason}")
             
             act_tab, safe_tab = st.tabs(["💡 추천 놀이", "🚨 안전 수칙"])
             with act_tab:
@@ -224,7 +237,7 @@ with tab2:
                 c1, c2, c3 = st.columns(3)
                 with c1: 
                     with st.popover("🏐 피구", use_container_width=True):
-                        st.markdown("**피구 놀이방법**\n\n- 공을 던져 상대편을 맞추는 게임입니다.\n- 공에 맞으면 아웃되어 경기장 밖으로 나가야 해요.")
+                        st.markdown("**피구 놀이방법**\n\n- 공을 던져 상대편을 맞추는 게임입니다.\n- 공에 맞으면 아웃되어 경기장 추방 밖으로 나가야 해요.")
                 with c2: 
                     with st.popover("🪢 단체 줄넘기", use_container_width=True):
                         st.markdown("**단체 줄넘기 놀이방법**\n\n- 두 사람이 긴 줄을 돌리고, 나머지 친구들이 타이밍을 맞춰 줄 안으로 들어가 뜁니다.")
@@ -235,9 +248,9 @@ with tab2:
             with safe_tab:
                 st.warning("✔ 비가 내려 바닥이 미끄러울 수 있으니 절대 뛰지 않아요!\n\n✔ 기둥에 부딪히지 않도록 활동 범위를 정해놓고 놀아요!")
             
-        elif today_status_code == "classroom":
-            st.error("## 🌡 안전을 위해 오늘은 [ 교실 ] 에서 놀아요!")
-            st.write(f"**이유:** {today_reason}")
+        elif sel_status_code == "classroom":
+            st.error(f"## 🌡 안전을 위해 {sel_weekday}요일엔 [ 교실 ] 에서 놀아요!")
+            st.write(f"**이유:** {sel_reason}")
             
             act_tab, safe_tab = st.tabs(["💡 추천 놀이", "🚨 안전 수칙"])
             with act_tab:
