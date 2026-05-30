@@ -34,5 +34,5 @@ streamlit run app.py
 ## 4. Streamlit Cloud 배포
 
 1. GitHub public 저장소에 푸시
-2. <https://share.streamlit.io> → New app → 저장소·`app.py` 선택
-3. Deploy
+2. [Streamlit Share](https://share.streamlit.io) 접속 → **New app** 클릭 → 본인 저장소 및 `app.py` 선택
+3. **Deploy** 버튼 클릭
