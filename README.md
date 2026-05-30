@@ -18,10 +18,11 @@
 
 | 컬럼명 (API 항목) | 타입 | 기준 예시 | 필수 |
 |--------|------|------|------|
-| `TMP (1시간 기온)` | JSON | 12°C 미만 또는 30°C 초과 시 교실 추천 | ✅ |
-| `POP (강수확률)` | JSON | 30% 이상 시 필로티 추천 | ✅ |
+| `TMP (1시간 기온)` | JSON | 12°C~30°C 범위 내일 때 야외 활동 가능 (범위 이탈 시 교실 추천) | ✅ |
+| `POP (강수확률)` | JSON | 30% 미만일 때 운동장 추천 (30% 이상 시 필로티 추천) | ✅ |
 
-샘플: 기상청 단기예보 오픈API 실시간 연동 (별도 업로드 파일 없음)
+* **종합 장소 판정 조건**: 기온이 적절하고(12°C~30°C) 강수확률이 낮으면(30% 미만) **'운동장'** 활동을 최우선으로 추천합니다.
+* **샘플**: 기상청 단기예보 오픈API 실시간 연동 (별도 업로드 파일 없음)
 
 ## 3. 로컬 실행
 
@@ -30,9 +31,3 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
-
-## 4. Streamlit Cloud 배포
-
-1. GitHub public 저장소에 푸시
-2. [Streamlit Share](https://share.streamlit.io) 접속 → **New app** 클릭 → 본인 저장소 및 `app.py` 선택
-3. **Deploy** 버튼 클릭
