@@ -1,0 +1,25 @@
+# 1. 파이썬 캐시 파일 (불필요한 시스템 파일)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 2. 가상환경 폴더 (용량이 크고 컴퓨터마다 환경이 다름)
+.venv/
+venv/
+env/
+
+# 3. 데이터 파일 무시 (실제 학생 데이터 유출 방지)
+*.csv
+*.xlsx
+
+# (선택) 샘플 데이터는 깃허브에 올라가도록 예외 처리 
+# (만약 sample_data.csv 파일이 있다면 아래 느낌표(!)를 통해 업로드를 허용합니다)
+!sample_data.csv
+
+# 4. Streamlit 보안 (API 키, 비밀번호 등이 들어가는 파일)
+.streamlit/secrets.toml
+
+# 5. OS 생성 파일 (맥/윈도우 찌꺼기 파일)
+.DS_Store
+Thumbs.db
