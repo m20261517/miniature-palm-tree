@@ -243,40 +243,73 @@ def pm10_grade_from_value(pm10: float | None):
         return "나쁨", 3
     return "매우나쁨", 4
 
+
+def format_pm10_reason(pm10: float | None, pm10_grade: str | None, pm10_grade_num: int | None):
+    """판정 근거 문장에 넣을 미세먼지 요약 문자열."""
+    if pm10 is None and pm10_grade is None and pm10_grade_num is None:
+        return "미세먼지 정보가 없어요"
+
+    parts = []
+    if pm10 is not None:
+        parts.append(f"PM10 {pm10:.0f}㎍/㎥")
+    if pm10_grade is not None:
+        parts.append(f"등급 {pm10_grade}")
+    if pm10_grade_num is not None and pm10_grade is None:
+        parts.append(f"(grade {pm10_grade_num})")
+
+    return ", ".join(parts)
+
 # ==========================================
 # 4. 장소 추천 우선순위 로직 (운동장 > 필로티 > 교실)
 # ==========================================
 # - 요청사항 반영:
 #   * 미세먼지 "나쁨"(grade 3)부터는 기온/강수확률과 무관하게 교실 추천
 #   * "보통" 이상(=보통/나쁨/매우나쁨)이어도, "나쁨" 미만이면 기존 로직대로 판단
+# - 추가 요청 반영:
+#   * 판정 근거(reason) 문장에 미세먼지 정보도 함께 노출
 
-def judge_lunch(tmp_dict, pop_dict, pm10_grade_num: int | None = None, pm10_grade_label: str | None = None):
+def judge_lunch(
+    tmp_dict,
+    pop_dict,
+    pm10: float | None = None,
+    pm10_grade_num: int | None = None,
+    pm10_grade_label: str | None = None,
+):
     temps = [v for v in tmp_dict.values() if v is not None]
     pops = [v for v in pop_dict.values() if v is not None]
+
+    pm10_reason = format_pm10_reason(pm10, pm10_grade_label, pm10_grade_num)
 
     # 미세먼지 우선 안전 판단
     if pm10_grade_num is not None and pm10_grade_num >= 3:
         label = pm10_grade_label or {3: "나쁨", 4: "매우나쁨"}.get(pm10_grade_num, "나쁨")
-        return "교실", "classroom", f"미세먼지가 '{label}'이라(grade {pm10_grade_num}) 기온/강수와 관계없이 실내가 안전해요."
+        return "교실", "classroom", (
+            f"미세먼지가 '{label}'이라(grade {pm10_grade_num}) 기온/강수와 관계없이 실내가 안전해요."
+            f" (미세먼지: {pm10_reason})"
+        )
 
     if not temps or not pops:
-        return "알 수 없음", "unknown", "점심 예보가 아직 없거나 이미 지난 시간이에요. (단기예보는 오늘~모레까지 제공돼요)"
+        return "알 수 없음", "unknown", (
+            "점심 예보가 아직 없거나 이미 지난 시간이에요. (단기예보는 오늘~모레까지 제공돼요)"
+            f" (미세먼지: {pm10_reason})"
+        )
 
     avg_temp = sum(temps) / len(temps)
 
     # 기온이 범위를 벗어나면 교실 (최우선 안전 판단)
     if avg_temp < 12:
-        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 쌀쌀해서 실내가 안전해요."
+        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 쌀쌀해서 실내가 안전해요. (미세먼지: {pm10_reason})"
     if avg_temp > 30:
-        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 너무 더워서 실내가 안전해요."
+        return "교실", "classroom", f"기온이 {avg_temp:.1f}°C로 너무 더워서 실내가 안전해요. (미세먼지: {pm10_reason})"
 
     # 기온은 적절하지만 비 소식 → 필로티
     max_pop = max(pops)
     if max_pop >= 30:
-        return "필로티", "piloti", f"기온은 좋지만 비 올 확률이 {max_pop:.0f}%라 비를 피할 수 있는 곳이 좋아요."
+        return "필로티", "piloti", f"기온은 좋지만 비 올 확률이 {max_pop:.0f}%라 비를 피할 수 있는 곳이 좋아요. (미세먼지: {pm10_reason})"
 
     # 기온 적절 + 비 안 옴 → 운동장
-    return "운동장", "playground", f"기온 {avg_temp:.1f}°C, 강수확률 {max_pop:.0f}%로 야외활동에 딱 좋아요!"
+    return "운동장", "playground", f"기온 {avg_temp:.1f}°C, 강수확률 {max_pop:.0f}%로 야외활동에 딱 좋아요! (미세먼지: {pm10_reason})"
+
 
 def calc_summary(tmp_dict, pop_dict):
     temps = [v for v in tmp_dict.values() if v is not None]
@@ -427,6 +460,7 @@ with tab2:
         place, status_code, reason = judge_lunch(
             tmp_dict,
             pop_dict,
+            pm10=pm10,
             pm10_grade_num=pm10_grade_num,
             pm10_grade_label=pm10_grade,
         )
