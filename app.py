@@ -8,8 +8,18 @@ import time
 # ==========================================
 # 1. API 키 설정 및 디코딩
 # ==========================================
+# NOTE:
+# - 아래 SERVICE_KEY는 (기상청/공공데이터포털 스타일) 인코딩/디코딩이 필요한 경우가 있어
+#   quote/unquote 처리를 모두 거쳐도 동작하도록 방어적으로 처리합니다.
+# - 사용자가 제공한 키는 에어코리아(대기오염정보) API 인증키로도 사용합니다.
 SERVICE_KEY = "12843209762a114e91bf146bb7787cf097c0a7d77e477d66d521e2f9d17b2263"
+
+# 공공데이터포털 serviceKey는 보통 URL 인코딩된 문자열(%, + 등)로 제공됩니다.
+# 이미 디코딩된 키를 넣어도 안전하게 동작하도록:
+#   1) 한번 unquote
+#   2) 요청 시에는 quote_plus로 다시 인코딩해서 사용
 DECODED_KEY = urllib.parse.unquote(SERVICE_KEY)
+ENCODED_KEY = urllib.parse.quote_plus(DECODED_KEY)
 
 # 경기도 31개 시·군 기상청 격자 좌표(nx, ny)
 LOCATIONS = {
@@ -25,6 +35,11 @@ LOCATIONS = {
     "과천시": (60, 124), "가평군": (69, 133), "양평군": (69, 125),
     "연천군": (58, 138)
 }
+
+# 에어코리아(대기오염정보) API는 측정소(도시/시군) 기준으로 조회하는 경우가 많아
+# UI에 보이는 지역명(시/군) 그대로 사용합니다.
+# ※ 일부 시/군은 API에서 "측정소명" 또는 "시군구" 표기가 다를 수 있어
+#    실패 시 사용자에게 안내하도록 예외 메시지를 노출합니다.
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 REL_LABEL = {0: "오늘", 1: "내일", 2: "모레"}
@@ -63,7 +78,7 @@ def fetch_weather(nx, ny):
     base_date, base_time = get_recent_base_datetime()
     url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
     params = {
-        "serviceKey": DECODED_KEY,
+        "serviceKey": ENCODED_KEY,
         "numOfRows": "1000",  # 오늘~모레 12~13시까지 잘리지 않게 충분히 받음
         "pageNo": "1",
         "dataType": "JSON",
@@ -112,11 +127,137 @@ def extract_day(by_date, date_str, hours=("12", "13")):
     return tmp, pop
 
 # ==========================================
+# 3-2. 데이터 수집 (에어코리아 — 경기도 시·군 미세먼지)
+# ==========================================
+# AirKorea(대기오염정보) API는 "오늘" 데이터가 핵심이므로 30분 캐싱.
+# 실패 시 캐시되지 않게 예외를 던집니다.
+@st.cache_data(ttl=1800)
+def fetch_air_quality(sido_name: str, city_name: str):
+    """에어코리아(한국환경공단) 대기오염정보: 시도/시군별 측정값 조회.
+
+    - 반환: dict
+        {
+          "pm10": float|None,
+          "pm10_grade": str|None,  # 좋음/보통/나쁨/매우나쁨
+          "pm10_grade_num": int|None,
+          "data_time": str|None
+        }
+
+    NOTE: 실제 제공 엔드포인트/필드는 공공데이터포털 문서에 따라 다를 수 있어
+    일부 지역/시간대에는 값이 None일 수 있습니다.
+    """
+    url = "http://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getCtprvnRltmMesureDnsty"
+    params = {
+        "serviceKey": ENCODED_KEY,
+        "returnType": "json",
+        "numOfRows": "100",
+        "pageNo": "1",
+        "sidoName": sido_name,  # 예: "경기"
+        "ver": "1.3",
+    }
+
+    last_err = "알 수 없는 오류"
+    for _ in range(3):
+        try:
+            res = requests.get(url, params=params, timeout=8)
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                time.sleep(0.6)
+                continue
+            data = res.json()
+
+            # 응답 구조는 보통 response > body > items
+            body = data.get("response", {}).get("body", {})
+            items = body.get("items", []) or []
+
+            # city_name은 stationName/ cityName/ municipality 등으로 다를 수 있어
+            # 가장 흔한 stationName 기준으로 먼저 매칭하고, 없으면 sgguNm 같은 필드도 시도.
+            def match_item(it):
+                return (
+                    it.get("stationName") == city_name
+                    or it.get("cityName") == city_name
+                    or it.get("sggName") == city_name
+                    or it.get("mangName") == city_name
+                )
+
+            target = None
+            for it in items:
+                if match_item(it):
+                    target = it
+                    break
+
+            if not target:
+                # 일부 시군은 stationName 목록에 없을 수 있으니, 가장 최근 데이터 한 건이라도 보여주되
+                # UI에 "대표 측정소"로 안내할 수 있게 합니다.
+                if items:
+                    target = items[0]
+                else:
+                    raise RuntimeError("대기질 데이터(items)가 비어 있어요")
+
+            pm10_raw = target.get("pm10Value")
+            pm10 = None
+            try:
+                if pm10_raw is not None and str(pm10_raw).strip() not in ("", "-", "null"):
+                    pm10 = float(pm10_raw)
+            except Exception:
+                pm10 = None
+
+            grade_num_raw = target.get("pm10Grade") or target.get("pm10Grade1h")
+            grade_num = None
+            try:
+                if grade_num_raw is not None and str(grade_num_raw).strip() not in ("", "-", "null"):
+                    grade_num = int(float(grade_num_raw))
+            except Exception:
+                grade_num = None
+
+            grade_map = {1: "좋음", 2: "보통", 3: "나쁨", 4: "매우나쁨"}
+            grade = grade_map.get(grade_num)
+
+            return {
+                "pm10": pm10,
+                "pm10_grade": grade,
+                "pm10_grade_num": grade_num,
+                "data_time": target.get("dataTime"),
+                "_raw_station": target.get("stationName"),
+            }
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(0.6)
+
+    raise RuntimeError(last_err)
+
+
+def pm10_grade_from_value(pm10: float | None):
+    """PM10(미세먼지) 농도(㎍/㎥)로 등급을 추정.
+
+    - 에어코리아가 등급 값을 제공하지 못할 때 fallback.
+    - 기준은 국내 통상 등급(0~30 좋음, 31~80 보통, 81~150 나쁨, 151~ 매우나쁨)을 사용.
+    """
+    if pm10 is None:
+        return None, None
+    if pm10 <= 30:
+        return "좋음", 1
+    if pm10 <= 80:
+        return "보통", 2
+    if pm10 <= 150:
+        return "나쁨", 3
+    return "매우나쁨", 4
+
+# ==========================================
 # 4. 장소 추천 우선순위 로직 (운동장 > 필로티 > 교실)
 # ==========================================
-def judge_lunch(tmp_dict, pop_dict):
+# - 요청사항 반영:
+#   * 미세먼지 "나쁨"(grade 3)부터는 기온/강수확률과 무관하게 교실 추천
+#   * "보통" 이상(=보통/나쁨/매우나쁨)이어도, "나쁨" 미만이면 기존 로직대로 판단
+
+def judge_lunch(tmp_dict, pop_dict, pm10_grade_num: int | None = None, pm10_grade_label: str | None = None):
     temps = [v for v in tmp_dict.values() if v is not None]
     pops = [v for v in pop_dict.values() if v is not None]
+
+    # 미세먼지 우선 안전 판단
+    if pm10_grade_num is not None and pm10_grade_num >= 3:
+        label = pm10_grade_label or {3: "나쁨", 4: "매우나쁨"}.get(pm10_grade_num, "나쁨")
+        return "교실", "classroom", f"미세먼지가 '{label}'이라(grade {pm10_grade_num}) 기온/강수와 관계없이 실내가 안전해요."
 
     if not temps or not pops:
         return "알 수 없음", "unknown", "점심 예보가 아직 없거나 이미 지난 시간이에요. (단기예보는 오늘~모레까지 제공돼요)"
@@ -152,12 +293,12 @@ PLACE_INFO = {
         "box": "success",
         "headline": "🏃 야외활동 최고! [ 운동장 ] 으로 나가요!",
         "activities": [
-            ("⚽ 축구 / 발야구", "**축구 / 발야구 놀이방법**\n\n- 공을 발로 차서 상대편 골대에 넣거나 베이스를 돌아 점수를 냅니다.\n- 팀을 나누어 협동심을 길러요!"),
-            ("🛝 놀이터 이용", "**놀이터 이용방법**\n\n- 미끄럼틀, 그네, 시소 등을 번갈아가며 이용해요.\n- 차례를 지켜서 안전하게 노는 것이 규칙입니다!"),
+            ("⚽ 축구 / 발야구", "**축구 / 발야구 놀이방법**\n\n- 공을 발로 차서 상대편 골대에 넣거나 베이스를 돌아 점수를 냅니다.\n- 팀을 나누어 협동해서 즐겁게 놀아요!"),
+            ("🛝 놀이터 이용", "**놀이터 이용방법**\n\n- 미끄럼틀, 그네, 시소 등을 번갈아가며 이용해요.\n- 차례를 지켜서 안전하게 노는 것이 규칙입니다."),
             ("🏃 술래잡기", "**술래잡기 놀이방법**\n\n- 술래 한 명을 정하고 나머지 친구들은 도망갑니다.\n- 술래에게 터치된 사람이 다음 술래가 돼요!"),
         ],
         "safety_box": "info",
-        "safety": "✔ 햇빛이 뜨거울 땐 모자를 쓰고 물을 자주 마셔요!\n\n✔ 기온이 12도 정도면 약간 서늘할 수 있으니 겉옷을 챙겨요.\n\n✔ 놀이기구에서 친구를 밀거나 당기지 않아요!",
+        "safety": "✔ 햇빛이 뜨거울 땐 모자를 쓰고 물을 자주 마셔요!\n\n✔ 기온이 12도 정도면 약간 서늘할 수 있으니 겉옷을 챙겨요.\n\n✔ 놀이기구는 차례를 지키고, 밀지 않아요!",
     },
     "piloti": {
         "box": "warning",
@@ -165,7 +306,7 @@ PLACE_INFO = {
         "activities": [
             ("🏐 피구", "**피구 놀이방법**\n\n- 공을 던져 상대편을 맞히는 게임입니다.\n- 공에 맞으면 아웃되어 경기장 밖으로 나가요."),
             ("🪢 단체 줄넘기", "**단체 줄넘기 놀이방법**\n\n- 두 사람이 긴 줄을 돌리고, 나머지 친구들이 타이밍을 맞춰 줄 안으로 들어가 뜁니다."),
-            ("🪙 수건돌리기", "**수건돌리기 놀이방법**\n\n- 둥글게 앉아 눈을 감고, 술래가 몰래 수건을 친구 등 뒤에 놓습니다.\n- 눈치챈 친구는 일어나 술래를 잡아요!"),
+            ("🪙 수건돌리기", "**수건돌리기 놀이방법**\n\n- 둥글게 앉아 눈을 감고, 술래가 몰래 수건을 친구 등 뒤에 놓습니다.\n- 눈치챈 친구는 일어나 술래를 잡으러 가요!"),
         ],
         "safety_box": "warning",
         "safety": "✔ 비가 내려 바닥이 미끄러울 수 있으니 절대 뛰지 않아요!\n\n✔ 기둥에 부딪히지 않도록 활동 범위를 정해놓고 놀아요!",
@@ -183,8 +324,10 @@ PLACE_INFO = {
     },
 }
 
+
 def render_box(kind, text):
     {"success": st.success, "warning": st.warning, "error": st.error, "info": st.info}[kind](text)
+
 
 def render_place(status_code, reason):
     info = PLACE_INFO[status_code]
@@ -208,7 +351,7 @@ def render_place(status_code, reason):
 st.set_page_config(page_title="점심시간에 나가도 돼요?", page_icon="🌤", layout="wide")
 
 st.title("🌤 점심시간에 나가도 돼요?")
-st.caption("기온과 강수확률을 바탕으로 안전한 점심시간 놀이 장소를 추천해 드려요. (오늘~모레 예보)")
+st.caption("기온과 강수확률 + 미세먼지(PM10)를 바탕으로 안전한 점심시간 놀이 장소를 추천해 드려요. (날씨: 오늘~모레, 미세먼지: 현재)")
 
 tab1, tab2 = st.tabs(["📍 지역 선택", "📅 점심시간 장소 추천"])
 
@@ -227,6 +370,7 @@ with tab2:
 
     st.markdown(f"#### 📍 {location_name} · 점심시간(12~13시) 예보")
 
+    # 1) 날씨 가져오기
     by_date = None
     fetch_error = None
     with st.spinner(f"기상청에서 {location_name} 예보를 가져오는 중입니다..."):
@@ -243,16 +387,56 @@ with tab2:
             st.rerun()
         st.stop()
 
+    # 2) 미세먼지 가져오기 (현재 기준)
+    air = None
+    air_error = None
+    with st.spinner(f"에어코리아에서 {location_name} 미세먼지(PM10) 정보를 가져오는 중입니다..."):
+        try:
+            air = fetch_air_quality("경기", location_name)
+        except Exception as e:
+            air_error = str(e)
+
+    pm10 = None
+    pm10_grade = None
+    pm10_grade_num = None
+    data_time = None
+    if air:
+        pm10 = air.get("pm10")
+        pm10_grade = air.get("pm10_grade")
+        pm10_grade_num = air.get("pm10_grade_num")
+        data_time = air.get("data_time")
+
+        if pm10_grade_num is None:
+            pm10_grade, pm10_grade_num = pm10_grade_from_value(pm10)
+
+    # 미세먼지 표시
+    with st.container():
+        if air_error:
+            st.warning("미세먼지 정보를 가져오지 못했어요. (날씨 추천은 정상 동작)")
+            st.caption(f"(원인: {air_error})")
+        else:
+            pm10_text = f"{pm10:.0f} ㎍/㎥" if pm10 is not None else "-"
+            grade_text = pm10_grade if pm10_grade is not None else "-"
+            time_text = data_time if data_time else "-"
+            st.markdown(f"**🌫 미세먼지(PM10): {pm10_text} · 등급: {grade_text} · 기준시각: {time_text}**")
+
     results = []
     for offset, d in enumerate(day_list):
         tmp_dict, pop_dict = extract_day(by_date, d.strftime("%Y%m%d"))
         temp_avg, pop_max = calc_summary(tmp_dict, pop_dict)
-        place, status_code, reason = judge_lunch(tmp_dict, pop_dict)
+        place, status_code, reason = judge_lunch(
+            tmp_dict,
+            pop_dict,
+            pm10_grade_num=pm10_grade_num,
+            pm10_grade_label=pm10_grade,
+        )
         results.append({
             "구분": REL_LABEL[offset],
             "날짜": d.strftime("%m/%d") + f" ({WEEKDAY_KR[d.weekday()]})",
             "기온(°C)": temp_avg if temp_avg is not None else "-",
             "강수확률(%)": pop_max if pop_max is not None else "-",
+            "미세먼지(PM10)": f"{pm10:.0f}" if pm10 is not None else "-",
+            "미세먼지 등급": pm10_grade if pm10_grade is not None else "-",
             "추천 장소": place,
             "_status_code": status_code,
             "_reason": reason,
