@@ -53,24 +53,6 @@ def kst_now():
     # Streamlit Cloud 서버는 UTC라서 한국시간(KST)으로 변환
     return datetime.datetime.now(KST)
 
-# ==========================================
-# 2-2. (중기예보) 발표 시각 계산
-# ==========================================
-# 중기예보는 일반적으로 06시/18시 발표가 많아, 직전 발표값을 사용합니다.
-# (API 제공 지연 버퍼 15분 적용)
-
-def get_recent_mid_base_datetime():
-    now = kst_now() - datetime.timedelta(minutes=15)
-    base_date = now.strftime("%Y%m%d")
-    if now.hour >= 18:
-        return base_date, "1800"
-    if now.hour >= 6:
-        return base_date, "0600"
-    # 새벽에는 전날 1800 사용
-    base_date = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
-    return base_date, "1800"
-
-
 def get_recent_base_datetime():
     # 오늘 점심(12~13시)이 오후·저녁에도 항상 예보에 포함되도록 base_time을 1100 이하로 제한한다.
     # (1400 이후 발표는 예보가 14시부터 시작해 오늘 점심이 빠져버림)
@@ -143,101 +125,6 @@ def extract_day(by_date, date_str, hours=("12", "13")):
     tmp = {h: day["TMP"].get(h) for h in hours}
     pop = {h: day["POP"].get(h) for h in hours}
     return tmp, pop
-
-# ==========================================
-# 3-1. 데이터 수집 (중기예보 — 한 주간)
-# ==========================================
-# 중기예보는 지역별 "예보구역 코드(regId)"가 필요합니다.
-# 여기서는 경기도(수도권) 대표 regId를 사용합니다.
-# ※ 향후 도시별로 더 정확히 하려면 LOCATIONS와 별도의 regId 매핑 테이블을 추가하면 됩니다.
-MID_REG_ID = "11B00000"  # 수도권(서울/인천/경기) (중기육상예보 대표)
-
-@st.cache_data(ttl=1800)
-def fetch_mid_land_forecast(reg_id: str = MID_REG_ID):
-    """기상청 중기육상예보(한 주간) 조회.
-
-    - getMidLandFcst: 3~10일(또는 제공 범위) 강수확률/날씨요약 등의 정보를 제공
-    - 반환은 API 원본 item(dict)
-    """
-    base_date, base_time = get_recent_mid_base_datetime()
-    tm_fc = f"{base_date}{base_time}"  # 예: 202606040600
-
-    url = "http://apis.data.go.kr/1360000/MidFcstInfoService/getMidLandFcst"
-    params = {
-        "serviceKey": ENCODED_KEY,
-        "dataType": "JSON",
-        "numOfRows": "10",
-        "pageNo": "1",
-        "regId": reg_id,
-        "tmFc": tm_fc,
-    }
-
-    last_err = "알 수 없는 오류"
-    for _ in range(3):
-        try:
-            res = requests.get(url, params=params, timeout=8)
-            if res.status_code != 200:
-                last_err = f"HTTP {res.status_code}"
-                time.sleep(0.6)
-                continue
-            data = res.json()
-            header = data.get("response", {}).get("header", {})
-            if header.get("resultCode") != "00":
-                last_err = header.get("resultMsg", "API 오류")
-                time.sleep(0.6)
-                continue
-
-            items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
-            if not items:
-                raise RuntimeError("중기예보 데이터(item)가 비어 있어요")
-            return {
-                "tmFc": tm_fc,
-                "regId": reg_id,
-                "item": items[0],
-            }
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(0.6)
-
-    raise RuntimeError(last_err)
-
-
-def extract_mid_pop(item: dict, day_offset: int, period: str):
-    """중기육상예보에서 강수확률 꺼내기.
-
-    day_offset: 3~10
-    period: "Am" | "Pm" (3~7) / 8~10은 보통 단일 값
-    """
-    # 3~7: rnSt3Am / rnSt3Pm ...
-    # 8~10: rnSt8 ...
-    if day_offset <= 7:
-        key = f"rnSt{day_offset}{period}"
-        v = item.get(key)
-    else:
-        key = f"rnSt{day_offset}"
-        v = item.get(key)
-
-    try:
-        if v is None or str(v).strip() in ("", "-", "null"):
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def calc_week_results_short_by_date(by_date, today: datetime.date):
-    """단기예보로 커버 가능한 0~2일(오늘/내일/모레)의 점심(12~13) 요약."""
-    results = []
-    for i in range(3):
-        d = today + datetime.timedelta(days=i)
-        tmp_dict, pop_dict = extract_day(by_date, d.strftime("%Y%m%d"))
-        temps = [v for v in tmp_dict.values() if v is not None]
-        pops = [v for v in pop_dict.values() if v is not None]
-        temp_avg = round(sum(temps) / len(temps), 1) if temps else None
-        pop_max = max(pops) if pops else None
-        results.append((d, temp_avg, pop_max))
-    return results
-
 
 # ==========================================
 # 3-2. 데이터 수집 (에어코리아 — 경기도 시·군 미세먼지)
@@ -497,7 +384,7 @@ def render_place(status_code, reason):
 st.set_page_config(page_title="점심시간에 나가도 돼요?", page_icon="🌤", layout="wide")
 
 st.title("🌤 점심시간에 나가도 돼요?")
-st.caption("기온과 강수확률 + 미세먼지(PM10)를 바탕으로 안전한 점심시간 놀이 장소를 추천해 드려요. (날씨: 한 주간, 미세먼지: 현재)")
+st.caption("기온과 강수확률 + 미세먼지(PM10)를 바탕으로 안전한 점심시간 놀이 장소를 추천해 드려요. (날씨: 오늘~모레, 미세먼지: 현재)")
 
 tab1, tab2 = st.tabs(["📍 지역 선택", "📅 점심시간 장소 추천"])
 
@@ -512,15 +399,16 @@ with tab2:
     location_name = st.session_state.get("location_name", list(LOCATIONS.keys())[0])
     nx, ny = LOCATIONS[location_name]
     today = kst_now().date()
+    day_list = [today + datetime.timedelta(days=i) for i in range(3)]  # 오늘, 내일, 모레
 
     st.markdown(f"#### 📍 {location_name} · 점심시간(12~13시) 예보")
 
-    # 1) 단기예보(0~2일) 가져오기
+    # 1) 날씨 가져오기
     by_date = None
     fetch_error = None
-    with st.spinner(f"기상청에서 {location_name} 단기예보(오늘~모레)를 가져오는 중입니다..."):
+    with st.spinner(f"기상청에서 {location_name} 예보를 가져오는 중입니다..."):
         try:
-            by_date = fetch_weather(nx, ny)
+            by_date = fetch_weather(nx, ny)  # 한 번 호출로 오늘~모레 전부
         except Exception as e:
             fetch_error = str(e)
 
@@ -528,24 +416,11 @@ with tab2:
         st.error("기상청 서버에서 예보를 받지 못했어요. 잠시 후 다시 시도해 주세요.")
         st.caption(f"(원인: {fetch_error})")
         if st.button("🔄 다시 시도"):
-            fetch_weather.clear()
+            fetch_weather.clear()  # 캐시 비우고 다시 호출
             st.rerun()
         st.stop()
 
-    # 2) 중기예보(3~7일+) 가져오기
-    mid = None
-    mid_error = None
-    with st.spinner("기상청 중기예보(한 주간)를 가져오는 중입니다..."):
-        try:
-            mid = fetch_mid_land_forecast(MID_REG_ID)
-        except Exception as e:
-            mid_error = str(e)
-
-    if mid_error:
-        st.warning("중기예보를 가져오지 못했어요. (오늘~모레는 정상 표시)")
-        st.caption(f"(원인: {mid_error})")
-
-    # 3) 미세먼지 가져오기 (현재 기준)
+    # 2) 미세먼지 가져오기 (현재 기준)
     air = None
     air_error = None
     with st.spinner(f"에어코리아에서 {location_name} 미세먼지(PM10) 정보를 가져오는 중입니다..."):
@@ -578,22 +453,19 @@ with tab2:
             time_text = data_time if data_time else "-"
             st.markdown(f"**🌫 미세먼지(PM10): {pm10_text} · 등급: {grade_text} · 기준시각: {time_text}**")
 
-    # 4) 결과 테이블 구성 (총 7일)
     results = []
-
-    # 0~2일: 단기예보 기반 (점심 12~13시)
-    short_list = calc_week_results_short_by_date(by_date, today)
-    for i, (d, temp_avg, pop_max) in enumerate(short_list):
+    for offset, d in enumerate(day_list):
+        tmp_dict, pop_dict = extract_day(by_date, d.strftime("%Y%m%d"))
+        temp_avg, pop_max = calc_summary(tmp_dict, pop_dict)
         place, status_code, reason = judge_lunch(
-            # 단기 데이터는 기존 함수 형식 유지
-            extract_day(by_date, d.strftime("%Y%m%d"))[0],
-            extract_day(by_date, d.strftime("%Y%m%d"))[1],
+            tmp_dict,
+            pop_dict,
             pm10=pm10,
             pm10_grade_num=pm10_grade_num,
             pm10_grade_label=pm10_grade,
         )
         results.append({
-            "구분": REL_LABEL.get(i, f"+{i}일"),
+            "구분": REL_LABEL[offset],
             "날짜": d.strftime("%m/%d") + f" ({WEEKDAY_KR[d.weekday()]})",
             "기온(°C)": temp_avg if temp_avg is not None else "-",
             "강수확률(%)": pop_max if pop_max is not None else "-",
@@ -604,50 +476,10 @@ with tab2:
             "_reason": reason,
         })
 
-    # 3~6일: 중기예보 기반 (오전/오후 강수확률이 있으면 max로 요약)
-    if mid and not mid_error:
-        item = mid["item"]
-        for day_offset in range(3, 7):
-            d = today + datetime.timedelta(days=day_offset)
-
-            # 중기예보는 기온(최저/최고) API가 별도라서 여기서는 "-"로 표시
-            # 강수확률은 오전/오후 값 중 최대를 사용
-            rn_am = extract_mid_pop(item, day_offset, "Am")
-            rn_pm = extract_mid_pop(item, day_offset, "Pm")
-            pops = [v for v in (rn_am, rn_pm) if v is not None]
-            pop_max = max(pops) if pops else None
-
-            # 점심 추천은 기존 judge_lunch를 그대로 쓰기 위해
-            # 기온/강수확률만으로 가짜 dict를 만들어 넣습니다.
-            # (중기예보는 시각별이 아니라 일별이므로 점심값이 아닌 대표값입니다.)
-            tmp_dict = {"12": 20.0, "13": 20.0}  # 온도는 중기에서는 미제공 → 안전하게 20도로 두고, 강수만 반영
-            pop_dict = {"12": pop_max, "13": pop_max}
-
-            place, status_code, reason = judge_lunch(
-                tmp_dict,
-                pop_dict,
-                pm10=pm10,
-                pm10_grade_num=pm10_grade_num,
-                pm10_grade_label=pm10_grade,
-            )
-
-            results.append({
-                "구분": f"{day_offset}일 후",
-                "날짜": d.strftime("%m/%d") + f" ({WEEKDAY_KR[d.weekday()]})",
-                "기온(°C)": "-",
-                "강수확률(%)": pop_max if pop_max is not None else "-",
-                "미세먼지(PM10)": f"{pm10:.0f}" if pm10 is not None else "-",
-                "미세먼지 등급": pm10_grade if pm10_grade is not None else "-",
-                "추천 장소": place,
-                "_status_code": status_code,
-                "_reason": reason,
-            })
-
     df = pd.DataFrame(results)
     st.dataframe(
         df.drop(columns=["_status_code", "_reason"]),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
     st.markdown("---")
